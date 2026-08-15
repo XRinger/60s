@@ -3,18 +3,19 @@ name: Daily News → Telegram
 # ============================================================
 # 用途：按【主题】抓取新闻，每个主题单独一条消息推送到 Telegram
 #
-# 必做（GitHub 网页操作）：
+# 必做（GitHub 网页操作，只需一次）：
 #   Settings → Secrets and variables → Actions → New repository secret
 #     BOT_TOKEN = Telegram Bot Token（@BotFather 创建）
 #     CHAT_ID   = 你的 Chat ID（getUpdates 里 "chat":{"id":xxx}）
 #
-# 主题配置（单个变量，一行 JSON 粘贴）：
+# 可选：主题覆盖（不配置则使用内置默认，内置已含 31 个可用新闻源）
 #   Settings → Secrets and variables → Actions → Variables → New variable
-#   Name:  THEMES
-#   Value: {"AI":{"sources":["https://..."],"keywords":""},"科技":{"sources":["https://..."],"keywords":""}}
-#   - 键的顺序 = 推送顺序；sources 为该主题的新闻源（text 格式，多个用逗号）
+#   Name:  THEMES   Value: {"AI":{"limit":4,"keywords":"","sources":[
+#     "https://...", {"label":"某源","url":"https://..."}]},"科技":{...}}
+#   - 键的顺序 = 推送顺序；sources 可为字符串 URL 或 {"label","url"} 对象
+#   - 支持的源类型：RSS / Atom / JSON 数组（含 title 字段）/ Google News RSS
 #   - keywords 逗号分隔，留空 = 推送该主题全部条目；非空 = 只推含任一关键词的条目（无匹配则跳过该主题）
-#   - 不配置 THEMES 时使用内置默认（AI→AI资讯、科技→IT资讯；eVtol/股市 待你提供新闻源）
+#   - limit = 每源最多取多少条（默认 4）；消息超 3900 字符自动截断
 #
 # 手动测试：Actions 页面 → Run workflow（无需等定时）
 # ============================================================
@@ -41,28 +42,121 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
-          # 主题配置 JSON（单行粘贴，见文件头注释）
+          # 可选的主题覆盖 JSON（见文件头注释；不设置则用内置默认）
           THEMES: ${{ vars.THEMES }}
         run: |
           python3 - <<'PYEOF'
           import html, json, os, re, sys, urllib.parse, urllib.request
           from datetime import datetime, timezone, timedelta
+          from xml.etree import ElementTree as ET
 
           BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
           CHAT_ID = os.environ.get("CHAT_ID", "").strip()
           THEMES_RAW = (os.environ.get("THEMES") or "").strip()
 
-          ITEM_RE = re.compile(r"^\s*\d+\.\s*")  # "1. xxx" 条目行
+          UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
+          # ---------- 内置默认主题（31 个已实测可用的源；THEMES 变量可整体覆盖） ----------
+          GN = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+          GNZH = "https://news.google.com/rss/search?q={q}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+          def g(q):  return GN.format(q=urllib.parse.quote(q))   # Google News（英文）
+          def gz(q): return GNZH.format(q=urllib.parse.quote(q)) # Google News（中文）
+
+          DEFAULT_THEMES = {
+              "AI": {"limit": 4, "keywords": "", "sources": [
+                  {"label": "OpenAI",      "url": "https://openai.com/news/rss.xml"},
+                  {"label": "Anthropic",   "url": g("site:anthropic.com")},
+                  {"label": "DeepMind",    "url": g("site:deepmind.google")},
+                  {"label": "NVIDIA",      "url": "https://blogs.nvidia.com/feed/"},
+                  {"label": "HF Blog",     "url": "https://huggingface.co/blog/feed.xml"},
+                  {"label": "HF Papers",   "url": "https://huggingface.co/api/papers"},
+                  {"label": "arXiv AI",    "url": "http://export.arxiv.org/rss/cs.AI"},
+                  {"label": "HackerNews",  "url": "https://news.ycombinator.com/rss"},
+                  {"label": "MIT TechRev", "url": "https://www.technologyreview.com/feed/"},
+                  {"label": "LatentSpace", "url": "https://www.latent.space/feed"},
+              ]},
+              "科技": {"limit": 4, "keywords": "", "sources": [
+                  {"label": "ReutersTech", "url": g("site:reuters.com technology")},
+                  {"label": "TechCrunch",  "url": "https://techcrunch.com/feed/"},
+                  {"label": "TheVerge",    "url": "https://www.theverge.com/rss/index.xml"},
+                  {"label": "ArsTechnica", "url": "https://feeds.arstechnica.com/arstechnica/index"},
+                  {"label": "IEEESpectrum","url": "https://spectrum.ieee.org/feeds/feed.rss"},
+                  {"label": "SemiAnalysis","url": "https://www.semianalysis.com/rss/"},
+                  {"label": "TheRegister", "url": "https://www.theregister.com/headlines.atom"},
+                  {"label": "WIRED",       "url": "https://www.wired.com/feed/rss"},
+                  {"label": "HackerNews",  "url": "https://news.ycombinator.com/rss"},
+                  {"label": "Lobsters",    "url": "https://lobste.rs/newest.rss"},
+              ]},
+              "eVtol": {"limit": 4, "keywords": "", "sources": [
+                  {"label": "ReutersAero", "url": g("site:reuters.com aerospace")},
+                  {"label": "FlightGlobal","url": g("site:flightglobal.com")},
+                  {"label": "AvWeek",      "url": g("site:aviationweek.com")},
+                  {"label": "AIN",         "url": g("site:ainonline.com")},
+                  {"label": "AirCurrent",  "url": g("site:theaircurrent.com")},
+                  {"label": "VertMag",     "url": "https://verticalmag.com/feed/"},
+                  {"label": "低空经济",    "url": gz("(低空经济 OR eVTOL OR 无人机)")},
+              ]},
+              "股市": {"limit": 4, "keywords": "", "sources": [
+                  {"label": "ReutersMkt",  "url": g("site:reuters.com markets")},
+                  {"label": "FT Markets",  "url": g("site:ft.com markets")},
+                  {"label": "A股",         "url": gz("(A股 OR 沪指 OR 深成指 OR 创业板)")},
+                  {"label": "港股",        "url": gz("(港股 OR 恒生指数 OR 恒指)")},
+              ]},
+          }
+
+          # ---------- 基础函数 ----------
           def bj_now():
               return datetime.now(timezone.utc) + timedelta(hours=8)
 
           def fetch(url, timeout=30):
-              req = urllib.request.Request(url, headers={
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-              })
+              req = urllib.request.Request(url, headers=UA)
               with urllib.request.urlopen(req, timeout=timeout) as r:
                   return r.read().decode("utf-8", errors="replace")
+
+          def clean(s):
+              return re.sub(r"\s+", " ", s or "").strip()
+
+          def strip_src_suffix(t):
+              # 去掉 Google News 标题末尾的 " - 来源名"（小节已有【标签】）
+              return re.sub(r"\s-\s[\w .'&+'-]+\Z", "", t).strip() or t
+
+          def host(url):
+              try:
+                  h = urllib.parse.urlparse(url).netloc
+                  return "GoogleNews" if h == "news.google.com" else re.sub(r"^www\.", "", h)
+              except Exception:
+                  return url[:20]
+
+          def parse_feed(url, body):
+              # JSON 数组（如 HuggingFace papers）
+              try:
+                  data = json.loads(body)
+                  if isinstance(data, list):
+                      return [(clean(strip_src_suffix(it["title"])), it.get("url") or "")
+                              for it in data if isinstance(it, dict) and it.get("title")]
+              except Exception:
+                  pass
+              # RSS / Atom
+              try:
+                  root = ET.fromstring(body)
+              except Exception:
+                  return []
+              entries = []
+              for it in root.findall(".//item"):
+                  t = it.findtext("title") or ""
+                  if t:
+                      entries.append((clean(strip_src_suffix(t)), it.findtext("link") or ""))
+              if not entries:
+                  ns = {"a": "http://www.w3.org/2005/Atom"}
+                  for it in root.findall(".//a:entry", ns):
+                      t = it.findtext("a:title", "", ns)
+                      ln = ""
+                      for lk in it.findall("a:link", ns):
+                          ln = lk.get("href", "")
+                          break
+                      if t:
+                          entries.append((clean(strip_src_suffix(t)), ln))
+              return entries
 
           def tg_send(text):
               data = urllib.parse.urlencode({
@@ -79,70 +173,82 @@ jobs:
               except Exception as e:
                   return None, str(e)
 
-          # 内置默认主题（未配置 THEMES 时使用；eVtol/股市 等你提供源后填进 THEMES）
-          DEFAULT_THEMES = json.dumps({
-              "AI":   {"sources": ["https://60s.viki.moe/v2/ai-news?encoding=text"], "keywords": ""},
-              "科技":  {"sources": ["https://60s.viki.moe/v2/it-news?encoding=text&limit=20"], "keywords": ""},
-              "eVtol": {"sources": [], "keywords": ""},
-              "股市":  {"sources": [], "keywords": ""},
-          }, ensure_ascii=False)
-
+          # ---------- 启动检查 ----------
           if not BOT_TOKEN or not CHAT_ID:
               print("::error::请先在仓库 Settings → Secrets 添加 BOT_TOKEN 和 CHAT_ID")
               sys.exit(1)
 
-          try:
-              themes = json.loads(THEMES_RAW) if THEMES_RAW else json.loads(DEFAULT_THEMES)
-          except Exception as e:
-              print(f"::error::THEMES JSON 解析失败（检查是否为合法 JSON 且单行）: {e}")
-              sys.exit(1)
-          if not isinstance(themes, dict) or not themes:
-              print("::error::THEMES 必须是非空 JSON 对象")
-              sys.exit(1)
+          if THEMES_RAW:
+              try:
+                  themes = json.loads(THEMES_RAW)
+              except Exception as e:
+                  print(f"::error::THEMES JSON 解析失败（检查是否为合法 JSON 且单行）: {e}")
+                  sys.exit(1)
+              if not isinstance(themes, dict) or not themes:
+                  print("::error::THEMES 必须是非空 JSON 对象")
+                  sys.exit(1)
+          else:
+              themes = DEFAULT_THEMES
 
           now = bj_now()
           week_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
           date_label = f"{now.strftime('%Y年%m月%d日')} · {week_cn}"
 
+          # ---------- 主流程 ----------
           success = 0
           for name, cfg in themes.items():
               sources = (cfg.get("sources") if isinstance(cfg, dict) else None) or []
               keywords = ((cfg.get("keywords") if isinstance(cfg, dict) else None) or "").strip()
-              print(f"[{name}] 开始处理，源数: {len(sources)}")
-              merged = ""
-              for url in sources:
-                  url = str(url).strip()
-                  if not url:
+              limit = int((cfg.get("limit") if isinstance(cfg, dict) else None) or 4)
+              print(f"[{name}] 开始处理，源数: {len(sources)}，每源上限: {limit}")
+
+              # 1. 逐源抓取 + 解析
+              sections = []
+              for s in sources:
+                  if isinstance(s, dict):
+                      src = {"label": str(s.get("label") or host(s.get("url", ""))),
+                             "url": str(s.get("url", ""))}
+                  else:
+                      src = {"label": host(str(s)), "url": str(s).strip()}
+                  if not src["url"]:
                       continue
                   try:
-                      text = fetch(url)
-                      merged += text + "\n\n"
-                      print(f"  ✓ 源获取成功 ({len(text)} 字符): {url}")
+                      entries = parse_feed(src["url"], fetch(src["url"]))
                   except Exception as e:
-                      print(f"  ✗ 源获取失败: {url} → {e}")
-              if not merged.strip():
+                      print(f"  ✗ {src['label']} 获取失败: {type(e).__name__} {str(e)[:60]}")
+                      continue
+                  entries = entries[:limit]
+                  if keywords:
+                      kw = [k.lower() for k in keywords.split(",") if k.strip()]
+                      entries = [e for e in entries if any(k in e[0].lower() for k in kw)]
+                  if entries:
+                      sections.append((src["label"], entries))
+                      print(f"  ✓ {src['label']}: {len(entries)} 条")
+                  else:
+                      print(f"  · {src['label']}: 无条目")
+              if not sections:
                   print(f"[{name}] 无可用内容，跳过")
                   continue
 
-              # 提取条目 + 关键词筛选（无匹配则跳过该主题，避免标题与内容不符）
-              items = [ln.strip() for ln in merged.splitlines() if ITEM_RE.match(ln)]
-              if keywords:
-                  kw = [k.strip().lower() for k in keywords.split(",") if k.strip()]
-                  if kw:
-                      matched = [ln for ln in items if any(k in ln.lower() for k in kw)]
-                      print(f"[{name}] 关键词 {keywords!r} → 匹配 {len(matched)}/{len(items)} 条")
-                      if not matched:
-                          print(f"[{name}] 无匹配，跳过该主题")
+              # 2. 组稿：每源一个小节 + 主题内去重
+              parts = []
+              seen = set()
+              for label, entries in sections:
+                  lines = []
+                  for i, (t, ln) in enumerate(entries, 1):
+                      key = re.sub(r"[^\w\u4e00-\u9fff]+", "", t.lower())
+                      if not key or key in seen:
                           continue
-                      items = matched
-
-              # 重新编号 + 截断（Telegram 单条上限 4096 字符）
-              body = "\n".join(f"{i+1}. {ITEM_RE.sub('', ln).strip()}" for i, ln in enumerate(items))
-              body = body[:3900].strip()
+                      seen.add(key)
+                      lines.append(f"{i}. {t}")
+                  if lines:
+                      parts.append(f"【{label}】\n" + "\n".join(lines))
+              body = "\n\n".join(parts)[:3900].strip()
               if not body:
-                  print(f"[{name}] 内容为空，跳过")
+                  print(f"[{name}] 去重后为空，跳过")
                   continue
 
+              # 3. 发送
               header = f"📰 <b>{name} · {date_label}</b>"
               message = f"{header}\n\n{html.escape(body)}\n\n- via 60s API"
               status, resp = tg_send(message)
