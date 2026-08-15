@@ -55,6 +55,12 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: |
+          # 去掉 Secret 粘贴时可能带入的空白/换行（常见坑：值末尾带 \n 会被 Telegram 拒为 chat not found）
+          BOT_TOKEN="${BOT_TOKEN//[$'\r\n\t ']/}"
+          CHAT_ID="${CHAT_ID//[$'\r\n\t ']/}"
+          echo "BOT_TOKEN length: ${#BOT_TOKEN}"
+          echo "CHAT_ID length: ${#CHAT_ID}"
+
           if [ -z "${BOT_TOKEN}" ] || [ -z "${CHAT_ID}" ]; then
             echo "::error::请先在仓库 Settings → Secrets 添加 BOT_TOKEN 和 CHAT_ID"
             exit 1
