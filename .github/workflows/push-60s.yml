@@ -1,9 +1,14 @@
 name: Daily News → Telegram
 
 # ============================================================
-# 用途：按【主题】抓取新闻，每个主题精选 5 条。每条推送：
-#   - 带图的新闻 → 图片消息（配图 + 中文标题 + 中文总结 + 来源链接）
-#   - 无图的新闻 → 汇总进主题文本消息（中文标题 + 中文总结 + 来源链接）
+# 用途：按【主题】抓取新闻，每个主题精选 5 条。每条新闻独立推送一条消息：
+#   [配图（如有）] → 加粗中文标题 → 中文正文 → 来源链接 → 分类名
+#   例如：
+#     🖼️（有图时）
+#     <b>苹果将 iPhone X 列为过时，停止所有硬件维修</b>
+#     苹果更新了停产与过时产品列表，iPhone X 被归为过时产品……
+#     [9To5Mac 链接]
+#     🤖 AI            ← 分类行：emoji + 分类名（emoji 可配置，可省）
 #
 # 必做（GitHub 网页操作，只需一次）：
 #   Settings → Secrets and variables → Actions → New repository secret
@@ -15,8 +20,9 @@ name: Daily News → Telegram
 #   Name:  THEMES   Value: {"AI":{"max":5,"keywords":"","sources":[
 #     "https://...", {"label":"某源","url":"https://..."}]},"科技":{...}}
 #   - 键的顺序 = 推送顺序；sources 可为字符串 URL 或 {"label","url"} 对象
+#   - 可选 emoji 字段 = 每条消息末尾的分类标签（如 "AI":{"emoji":"🤖"}，默认内置）
 #   - 支持的源类型：RSS / Atom / JSON 数组（含 title 字段）/ Bing News RSS
-#   - 摘要来源优先级：RSS description → 抓原文正文首段 → 仅标题
+#   - 正文来源优先级：RSS description → 抓原文正文首段 → 无正文仅标题
 #   - 图片来源：Bing News:Image / media:content / media:thumbnail / enclosure
 #   - max = 每主题最终推送条数（默认 5）：全部源汇总后按源顺序轮换精选，每条来自不同源
 #   - keywords 逗号分隔，留空 = 全部条目参与精选；非空 = 只精选含任一关键词的条目（无匹配则跳过该主题）
@@ -68,7 +74,7 @@ jobs:
               return "https://www.bing.com/news/search?q={}&format=rss&cc=us&setlang=en-us".format(urllib.parse.quote(q))
 
           DEFAULT_THEMES = {
-              "AI": {"max": 5, "keywords": "", "sources": [
+              "AI": {"max": 5, "keywords": "", "emoji": "🤖", "sources": [
                   {"label": "OpenAI",      "url": "https://openai.com/news/rss.xml"},
                   {"label": "Anthropic",   "url": bing("Anthropic")},
                   {"label": "DeepMind",    "url": bing("DeepMind")},
@@ -80,7 +86,7 @@ jobs:
                   {"label": "MIT TechRev", "url": "https://www.technologyreview.com/feed/"},
                   {"label": "LatentSpace", "url": "https://www.latent.space/feed"},
               ]},
-              "科技": {"max": 5, "keywords": "", "sources": [
+              "科技": {"max": 5, "keywords": "", "emoji": "🚀", "sources": [
                   {"label": "ReutersTech", "url": bing("site:reuters.com technology")},
                   {"label": "TechCrunch",  "url": "https://techcrunch.com/feed/"},
                   {"label": "TheVerge",    "url": "https://www.theverge.com/rss/index.xml"},
@@ -92,7 +98,7 @@ jobs:
                   {"label": "HackerNews",  "url": "https://news.ycombinator.com/rss"},
                   {"label": "Lobsters",    "url": "https://lobste.rs/newest.rss"},
               ]},
-              "eVtol": {"max": 5, "keywords": "", "sources": [
+              "eVtol": {"max": 5, "keywords": "", "emoji": "🚁", "sources": [
                   {"label": "ReutersAero", "url": bing("site:reuters.com aerospace")},
                   {"label": "FlightGlobal","url": bing("site:flightglobal.com")},
                   {"label": "AvWeek",      "url": bing("site:aviationweek.com")},
@@ -101,7 +107,7 @@ jobs:
                   {"label": "VertMag",     "url": "https://verticalmag.com/feed/"},
                   {"label": "低空经济",    "url": bing("低空经济")},
               ]},
-              "股市": {"max": 5, "keywords": "", "sources": [
+              "股市": {"max": 5, "keywords": "", "emoji": "📈", "sources": [
                   {"label": "ReutersMkt",  "url": bing("site:reuters.com markets")},
                   {"label": "FT Markets",  "url": bing("site:ft.com markets")},
                   {"label": "A股",         "url": bing("A股 沪指")},
@@ -221,6 +227,45 @@ jobs:
               except Exception:
                   return False
 
+          UI_WORDS = ("text settings", "story text", "subscribers only", "back to articles",
+                      "minimize to nav", "a]:hidden", "sign in", "log in", "subscribe",
+                      "cookie", "follow us", "share this", "privacy policy", "ot-pc", "onetrust", "optanon")
+
+          def extract_summary(html_body, max_len=500):
+              # 从 HTML 提取正文首段（优先 <article>/<main> 内的长段落，过滤 UI 导航垃圾）
+              h = re.sub(r"(?is)<(script|style|nav|header|footer|aside|form)[^>]*>.*?</\1>", " ", html_body)
+              m = re.search(r"(?is)<(article|main)[^>]*>(.*?)</(article|main)>", h)
+              region = m.group(2) if m else h
+              paras = re.findall(r"(?is)<p[^>]*>(.*?)</p>", region)
+              paras = [clean(html.unescape(re.sub(r"<[^>]+>", " ", p))) for p in paras]
+              text = ""
+              for p in paras:
+                  if len(p) >= 40:
+                      low = p.lower()
+                      if any(w in low for w in UI_WORDS):
+                          continue
+                      text = p
+                      break
+              if not text:
+                  # fallback：拼接所有干净长段落（同样过滤 UI 垃圾）
+                  text = " ".join(p for p in paras
+                                  if len(p) >= 40 and not any(w in p.lower() for w in UI_WORDS))
+              if len(text) < 40:
+                  # 无 ≥40 干净段落 → 取最长的干净段落（短正文也胜过整页垃圾）
+                  clean_paras = [p for p in paras if not any(w in p.lower() for w in UI_WORDS)]
+                  if clean_paras:
+                      text = max(clean_paras, key=len)
+                  else:
+                      text = clean(html.unescape(re.sub(r"<[^>]+>", " ", html_body)))
+              return text[:max_len]
+
+          def fetch_summary(link, max_len=500):
+              # 无 RSS 描述时，抓原文正文首段作为内容（失败返回空串 → 仅标题）
+              try:
+                  return extract_summary(fetch(link), max_len)
+              except Exception:
+                  return ""
+
           T_CACHE = {}
           def translate_zh(text, _retry=0):
               # 已是中文则跳过；否则用 Google 翻译成简体中文（免费，无需密钥）
@@ -313,16 +358,13 @@ jobs:
           else:
               themes = DEFAULT_THEMES
 
-          now = bj_now()
-          week_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now.weekday()]
-          date_label = f"{now.strftime('%Y年%m月%d日')} · {week_cn}"
-
           # ---------- 主流程 ----------
           success = 0
           for name, cfg in themes.items():
               sources = (cfg.get("sources") if isinstance(cfg, dict) else None) or []
               keywords = ((cfg.get("keywords") if isinstance(cfg, dict) else None) or "").strip()
               max_items = int((cfg.get("max") if isinstance(cfg, dict) else None) or 5)
+              emoji = (cfg.get("emoji") if isinstance(cfg, dict) else None) or "📰"
               print(f"[{name}] 开始处理，源数: {len(sources)}，精选 {max_items} 条")
 
               # 1. 逐源抓取 + 解析（每源取前 3 条作为候选）
@@ -359,58 +401,44 @@ jobs:
               if not selected:
                   print(f"[{name}] 精选为空，跳过")
                   continue
-              print(f"[{name}] 已精选 {len(selected)} 条，生成中文总结...")
+              print(f"[{name}] 已精选 {len(selected)} 条，逐条生成中文内容...")
 
-              # 3. 摘要 + 翻译 + 分拣（有图 → 图片消息；无图 → 文本消息）
-              photo_items, text_items = [], []
+              # 3. 每条新闻独立推送：图片(如有) → 加粗标题 → 正文 → 来源链接 → emoji
               for label, t, ln, desc, img in selected:
                   if desc_valid(desc, t):
-                      raw = desc[:300]
+                      raw = desc[:500]
+                  elif ln:
+                      raw = fetch_summary(ln)
                   else:
                       raw = ""
                   zh_title = translate_zh(t)
-                  zh_sum = translate_zh(raw)[:240].strip() if raw else ""
-                  if img and img_ok(img):
-                      photo_items.append((img, label, zh_title, zh_sum, ln))
-                  else:
-                      text_items.append((label, zh_title, zh_sum, ln))
-
-              # 4a. 文本消息（无图新闻汇总）
-              if text_items:
-                  lines = [f"📰 <b>{name} · {date_label}</b>", ""]
-                  for i, (label, zh_title, zh_sum, ln) in enumerate(text_items, 1):
-                      lines.append(f"{i}. <b>{html.escape(zh_title)}</b>")
-                      if zh_sum:
-                          lines.append(f"   {html.escape(zh_sum)}")
-                      if ln:
-                          lines.append(f"   <a href=\"{html.escape(ln, quote=True)}\">🔗 {html.escape(label)}</a>")
-                      lines.append("")
-                  body = "\n".join(lines)[:3900].strip()
-                  status, resp = tg_send(body)
-                  if status == 200:
-                      success += 1
-                      print(f"[{name}] ✅ 文本消息已发送 ({len(body)} 字符)")
-                  else:
-                      print(f"[{name}] ❌ 文本消息失败: HTTP {status} {resp}")
-
-              # 4b. 图片消息（有图新闻，每条一张配图）
-              for img, label, zh_title, zh_sum, ln in photo_items:
-                  cap = [f"📰 <b>{name} · {date_label}</b>", f"<b>{html.escape(zh_title)}</b>"]
+                  zh_sum = translate_zh(raw)[:400].strip() if raw else ""
+                  lines = [f"<b>{html.escape(zh_title)}</b>"]
                   if zh_sum:
-                      cap.append(html.escape(zh_sum))
+                      lines.append(html.escape(zh_sum))
                   if ln:
-                      cap.append(f"<a href=\"{html.escape(ln, quote=True)}\">🔗 {html.escape(label)}</a>")
-                  caption = "\n".join(cap)[:1024]
-                  status, resp = tg_send_photo(img, caption)
-                  if status == 200:
-                      success += 1
-                      print(f"[{name}] ✅ 图片消息已发送 ({label})")
-                  else:
-                      # 降级：图片发送失败则以文本形式发送该条
-                      print(f"[{name}] ⚠️ {label} 图片发送失败 HTTP {status}，降级为文本")
-                      status2, resp2 = tg_send(f"📰 <b>{name} · {date_label}</b>\n\n{caption}")
-                      if status2 == 200:
+                      lines.append(f"<a href=\"{html.escape(ln, quote=True)}\">{html.escape(label)}</a>")
+                  lines.append(f"{emoji} {name}" if emoji else name)  # 分类行：emoji + 分类名
+                  text = "\n\n".join(lines)
+                  if img and img_ok(img):
+                      status, resp = tg_send_photo(img, text[:1024])
+                      if status == 200:
                           success += 1
+                          print(f"[{name}] ✅ 图片消息: {label}")
+                      else:
+                          print(f"[{name}] ⚠️ {label} 图片失败 HTTP {status}，降级为文本")
+                          status2, resp2 = tg_send(text)
+                          if status2 == 200:
+                              success += 1
+                          else:
+                              print(f"[{name}] ❌ {label} 文本降级失败: HTTP {status2} {resp2}")
+                  else:
+                      status, resp = tg_send(text)
+                      if status == 200:
+                          success += 1
+                          print(f"[{name}] ✅ 文本消息: {label}")
+                      else:
+                          print(f"[{name}] ❌ {label} 发送失败: HTTP {status} {resp}")
 
           if success == 0:
               print("::error::所有主题消息均发送失败")
