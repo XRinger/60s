@@ -10,6 +10,14 @@ name: Daily 60s → Telegram
 #                 https://api.telegram.org/bot<TOKEN>/getUpdates 找到
 #                 "chat":{"id":xxx}，群组是负数，私聊是正数）
 #
+# 可选 - 关键词筛选（只推你关心的内容，随时可改，不用动代码）：
+#   Settings → Secrets and variables → Actions → Variables → New variable
+#     NEWS_KEYWORDS = 科技,AI,汽车   （逗号分隔；留空/不配 = 推送全部）
+#
+# 可选 - 换数据源（把整条推送换成其他主题接口）：
+#     SIXTY_API_URL = https://60s.viki.moe/v2/it-news?encoding=text&limit=10
+#                     其他：ai-news / zhihu / weibo / toutiao / bili 等，text 格式即可
+#
 # 手动测试：Actions 页面 → Run workflow（无需等定时）
 # ============================================================
 
@@ -54,6 +62,8 @@ jobs:
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          # 关键词筛选：逗号分隔（如 "科技,AI,汽车"），留空 = 不过滤推送全部
+          NEWS_KEYWORDS: ${{ vars.NEWS_KEYWORDS }}
         run: |
           # 去掉 Secret 粘贴时可能带入的空白/换行（常见坑：值末尾带 \n 会被 Telegram 拒为 chat not found）
           BOT_TOKEN="${BOT_TOKEN//[$'\r\n\t ']/}"
@@ -75,10 +85,40 @@ jobs:
           esac
           DATE_LABEL="$(date -u -d '+8 hours' +"%Y年%m月%d日") · ${WD}"
 
-          # HTML parse_mode 下转义内容中的 & < >
-          ESC="$(sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' "${RUNNER_TEMP}/sixty_text.txt")"
+          # ===== 关键词筛选 =====
+          # 只保留正文包含任一关键词的条目，重新编号；无匹配时退回推送全部
+          FILTERED=""
+          if [ -n "${NEWS_KEYWORDS}" ]; then
+            echo "${NEWS_KEYWORDS}" | tr ',' '\n' | sed '/^[[:space:]]*$/d' > "${RUNNER_TEMP}/keywords.txt"
+            ITEMS="$(grep -E '^[0-9]+\. ' "${RUNNER_TEMP}/sixty_text.txt")"
+            MATCHED="$(printf '%s\n' "${ITEMS}" | grep -F -i -f "${RUNNER_TEMP}/keywords.txt")"
+            TOTAL_COUNT="$(printf '%s\n' "${ITEMS}" | grep -c .)"
+            if [ -n "${MATCHED}" ]; then
+              FILTERED="$(printf '%s\n' "${MATCHED}" | awk '{ sub(/^[0-9]+\. /, NR". "); print }')"
+              MATCH_COUNT="$(printf '%s\n' "${FILTERED}" | grep -c .)"
+              echo "关键词筛选: 匹配 ${MATCH_COUNT} 条 / 共 ${TOTAL_COUNT} 条"
+            else
+              echo "关键词无匹配，将推送全部 ${TOTAL_COUNT} 条"
+            fi
+          fi
 
-          MESSAGE="$(printf '%s\n\n%s\n\n- via 60s API' "📰 <b>${DATE_LABEL} · 60秒读懂世界</b>" "${ESC}")"
+          # 组装正文（筛选结果优先，否则全部；仅筛选时补微语，避免全文回退时重复）
+          if [ -n "${FILTERED}" ]; then
+            BODY="${FILTERED}"
+            FILTER_NOTE="（已筛选：${NEWS_KEYWORDS}）"
+          else
+            BODY="$(cat "${RUNNER_TEMP}/sixty_text.txt")"
+            FILTER_NOTE=""
+          fi
+          QUOTE="$(grep '【微语】' "${RUNNER_TEMP}/sixty_text.txt" || true)"
+          if [ -n "${FILTERED}" ] && [ -n "${QUOTE}" ]; then
+            BODY="${BODY}"$'\n\n'"${QUOTE}"
+          fi
+
+          # HTML parse_mode 下转义内容中的 & < >
+          ESC="$(printf '%s' "${BODY}" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g')"
+
+          MESSAGE="$(printf '%s\n\n%s\n\n- via 60s API' "📰 <b>${DATE_LABEL} · 60秒读懂世界${FILTER_NOTE}</b>" "${ESC}")"
 
           HTTP_CODE="$(curl -sS -o "${RUNNER_TEMP}/tg_resp.json" -w '%{http_code}' -X POST \
             "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
