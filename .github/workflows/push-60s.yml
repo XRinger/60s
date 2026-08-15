@@ -10,12 +10,13 @@ name: Daily News → Telegram
 #
 # 可选：主题覆盖（不配置则使用内置默认，内置已含 31 个可用新闻源）
 #   Settings → Secrets and variables → Actions → Variables → New variable
-#   Name:  THEMES   Value: {"AI":{"limit":4,"keywords":"","sources":[
+#   Name:  THEMES   Value: {"AI":{"max":5,"keywords":"","sources":[
 #     "https://...", {"label":"某源","url":"https://..."}]},"科技":{...}}
 #   - 键的顺序 = 推送顺序；sources 可为字符串 URL 或 {"label","url"} 对象
 #   - 支持的源类型：RSS / Atom / JSON 数组（含 title 字段）/ Google News RSS
-#   - keywords 逗号分隔，留空 = 推送该主题全部条目；非空 = 只推含任一关键词的条目（无匹配则跳过该主题）
-#   - limit = 每源最多取多少条（默认 4）；消息超 3900 字符自动截断
+#   - max = 每主题最终推送条数（默认 5）：全部源汇总后按源顺序轮换精选，每条来自不同源
+#   - keywords 逗号分隔，留空 = 全部条目参与精选；非空 = 只精选含任一关键词的条目（无匹配则跳过该主题）
+#   - 英文标题自动翻译为简体中文（Google 翻译，无需任何密钥）；每条附来源链接可点击
 #
 # 手动测试：Actions 页面 → Run workflow（无需等定时）
 # ============================================================
@@ -63,7 +64,7 @@ jobs:
           def gz(q): return GNZH.format(q=urllib.parse.quote(q)) # Google News（中文）
 
           DEFAULT_THEMES = {
-              "AI": {"limit": 4, "keywords": "", "sources": [
+              "AI": {"max": 5, "keywords": "", "sources": [
                   {"label": "OpenAI",      "url": "https://openai.com/news/rss.xml"},
                   {"label": "Anthropic",   "url": g("site:anthropic.com")},
                   {"label": "DeepMind",    "url": g("site:deepmind.google")},
@@ -75,7 +76,7 @@ jobs:
                   {"label": "MIT TechRev", "url": "https://www.technologyreview.com/feed/"},
                   {"label": "LatentSpace", "url": "https://www.latent.space/feed"},
               ]},
-              "科技": {"limit": 4, "keywords": "", "sources": [
+              "科技": {"max": 5, "keywords": "", "sources": [
                   {"label": "ReutersTech", "url": g("site:reuters.com technology")},
                   {"label": "TechCrunch",  "url": "https://techcrunch.com/feed/"},
                   {"label": "TheVerge",    "url": "https://www.theverge.com/rss/index.xml"},
@@ -87,7 +88,7 @@ jobs:
                   {"label": "HackerNews",  "url": "https://news.ycombinator.com/rss"},
                   {"label": "Lobsters",    "url": "https://lobste.rs/newest.rss"},
               ]},
-              "eVtol": {"limit": 4, "keywords": "", "sources": [
+              "eVtol": {"max": 5, "keywords": "", "sources": [
                   {"label": "ReutersAero", "url": g("site:reuters.com aerospace")},
                   {"label": "FlightGlobal","url": g("site:flightglobal.com")},
                   {"label": "AvWeek",      "url": g("site:aviationweek.com")},
@@ -96,7 +97,7 @@ jobs:
                   {"label": "VertMag",     "url": "https://verticalmag.com/feed/"},
                   {"label": "低空经济",    "url": gz("(低空经济 OR eVTOL OR 无人机)")},
               ]},
-              "股市": {"limit": 4, "keywords": "", "sources": [
+              "股市": {"max": 5, "keywords": "", "sources": [
                   {"label": "ReutersMkt",  "url": g("site:reuters.com markets")},
                   {"label": "FT Markets",  "url": g("site:ft.com markets")},
                   {"label": "A股",         "url": gz("(A股 OR 沪指 OR 深成指 OR 创业板)")},
@@ -158,6 +159,45 @@ jobs:
                           entries.append((clean(strip_src_suffix(t)), ln))
               return entries
 
+          T_CACHE = {}
+          def translate_zh(text):
+              # 已是中文则跳过；否则用 Google 翻译成简体中文（免费，无需密钥）
+              if not text or re.search(r"[\u4e00-\u9fff]", text):
+                  return text
+              if text in T_CACHE:
+                  return T_CACHE[text]
+              try:
+                  data = urllib.parse.urlencode(
+                      {"q": text, "sl": "auto", "tl": "zh-CN", "dt": "t", "client": "gtx"}).encode()
+                  req = urllib.request.Request(
+                      "https://translate.googleapis.com/translate_a/single", data=data)
+                  req.add_header("User-Agent", UA["User-Agent"])
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      j = json.loads(r.read().decode("utf-8", errors="replace"))
+                  out = "".join(seg[0] for seg in j[0] if seg and seg[0]).strip()
+                  T_CACHE[text] = out or text
+                  return T_CACHE[text]
+              except Exception as e:
+                  print(f"  · 翻译失败({text[:30]}...): {str(e)[:40]}")
+                  return text
+
+          def pick_top(candidates, order, max_items=5, per_source=3):
+              # 轮换精选：按源顺序轮流取（每源最多 per_source 条候选），跨源去重，凑满 max_items
+              selected = []
+              seen = set()
+              for round_i in range(per_source):
+                  for label in order:
+                      entries = candidates.get(label) or []
+                      if round_i < len(entries):
+                          t, ln = entries[round_i]
+                          key = re.sub(r"[^\w\u4e00-\u9fff]+", "", t.lower())
+                          if key and key not in seen:
+                              seen.add(key)
+                              selected.append((label, t, ln))
+                              if len(selected) >= max_items:
+                                  return selected
+              return selected
+
           def tg_send(text):
               data = urllib.parse.urlencode({
                   "chat_id": CHAT_ID,
@@ -199,11 +239,12 @@ jobs:
           for name, cfg in themes.items():
               sources = (cfg.get("sources") if isinstance(cfg, dict) else None) or []
               keywords = ((cfg.get("keywords") if isinstance(cfg, dict) else None) or "").strip()
-              limit = int((cfg.get("limit") if isinstance(cfg, dict) else None) or 4)
-              print(f"[{name}] 开始处理，源数: {len(sources)}，每源上限: {limit}")
+              max_items = int((cfg.get("max") if isinstance(cfg, dict) else None) or 5)
+              print(f"[{name}] 开始处理，源数: {len(sources)}，精选 {max_items} 条")
 
-              # 1. 逐源抓取 + 解析
-              sections = []
+              # 1. 逐源抓取 + 解析（每源取前 3 条作为候选）
+              candidates = {}
+              order = []
               for s in sources:
                   if isinstance(s, dict):
                       src = {"label": str(s.get("label") or host(s.get("url", ""))),
@@ -217,40 +258,39 @@ jobs:
                   except Exception as e:
                       print(f"  ✗ {src['label']} 获取失败: {type(e).__name__} {str(e)[:60]}")
                       continue
-                  entries = entries[:limit]
                   if keywords:
                       kw = [k.lower() for k in keywords.split(",") if k.strip()]
                       entries = [e for e in entries if any(k in e[0].lower() for k in kw)]
                   if entries:
-                      sections.append((src["label"], entries))
-                      print(f"  ✓ {src['label']}: {len(entries)} 条")
+                      candidates[src["label"]] = entries[:3]
+                      order.append(src["label"])
+                      print(f"  ✓ {src['label']}: 候选 {min(3, len(entries))} 条")
                   else:
                       print(f"  · {src['label']}: 无条目")
-              if not sections:
+              if not candidates:
                   print(f"[{name}] 无可用内容，跳过")
                   continue
 
-              # 2. 组稿：每源一个小节 + 主题内去重
-              parts = []
-              seen = set()
-              for label, entries in sections:
-                  lines = []
-                  for i, (t, ln) in enumerate(entries, 1):
-                      key = re.sub(r"[^\w\u4e00-\u9fff]+", "", t.lower())
-                      if not key or key in seen:
-                          continue
-                      seen.add(key)
-                      lines.append(f"{i}. {t}")
-                  if lines:
-                      parts.append(f"【{label}】\n" + "\n".join(lines))
-              body = "\n\n".join(parts)[:3900].strip()
+              # 2. 轮换精选（每条来自不同源）+ 翻译成中文
+              selected = pick_top(candidates, order, max_items=max_items)
+              if not selected:
+                  print(f"[{name}] 精选为空，跳过")
+                  continue
+              print(f"[{name}] 已精选 {len(selected)} 条，翻译中...")
+              lines = []
+              for i, (label, t, ln) in enumerate(selected, 1):
+                  zh = translate_zh(t)
+                  lines.append(f"{i}. {html.escape(zh)}")
+                  if ln:
+                      lines.append(f"   <a href=\"{html.escape(ln, quote=True)}\">🔗 {html.escape(label)}</a>")
+              body = "\n".join(lines)[:3900].strip()
               if not body:
-                  print(f"[{name}] 去重后为空，跳过")
+                  print(f"[{name}] 内容为空，跳过")
                   continue
 
               # 3. 发送
               header = f"📰 <b>{name} · {date_label}</b>"
-              message = f"{header}\n\n{html.escape(body)}\n\n- via 60s API"
+              message = f"{header}\n\n{body}\n\n- via 60s API"
               status, resp = tg_send(message)
               if status == 200:
                   success += 1
