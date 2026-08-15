@@ -1,7 +1,8 @@
 name: Daily News → Telegram
 
 # ============================================================
-# 用途：按【主题】抓取新闻，每个主题单独一条消息推送到 Telegram
+# 用途：按【主题】抓取新闻，每个主题精选 5 条，每条推送：
+#   中文标题 + 中文内容总结（全文摘要）+ 可点击来源链接
 #
 # 必做（GitHub 网页操作，只需一次）：
 #   Settings → Secrets and variables → Actions → New repository secret
@@ -13,10 +14,11 @@ name: Daily News → Telegram
 #   Name:  THEMES   Value: {"AI":{"max":5,"keywords":"","sources":[
 #     "https://...", {"label":"某源","url":"https://..."}]},"科技":{...}}
 #   - 键的顺序 = 推送顺序；sources 可为字符串 URL 或 {"label","url"} 对象
-#   - 支持的源类型：RSS / Atom / JSON 数组（含 title 字段）/ Google News RSS
+#   - 支持的源类型：RSS / Atom / JSON 数组（含 title 字段）/ Bing News RSS
+#   - 摘要来源优先级：RSS description → 抓原文正文首段 → 仅标题
 #   - max = 每主题最终推送条数（默认 5）：全部源汇总后按源顺序轮换精选，每条来自不同源
 #   - keywords 逗号分隔，留空 = 全部条目参与精选；非空 = 只精选含任一关键词的条目（无匹配则跳过该主题）
-#   - 英文标题自动翻译为简体中文（Google 翻译，无需任何密钥）；每条附来源链接可点击
+#   - 英文内容自动翻译为简体中文（Google 翻译，无需任何密钥）；中文内容原样保留
 #
 # 手动测试：Actions 页面 → Run workflow（无需等定时）
 # ============================================================
@@ -58,16 +60,15 @@ jobs:
           UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"}
 
           # ---------- 内置默认主题（31 个已实测可用的源；THEMES 变量可整体覆盖） ----------
-          GN = "https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
-          GNZH = "https://news.google.com/rss/search?q={q}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
-          def g(q):  return GN.format(q=urllib.parse.quote(q))   # Google News（英文）
-          def gz(q): return GNZH.format(q=urllib.parse.quote(q)) # Google News（中文）
+          def bing(q):
+              # Bing News RSS：英文端点可同时返回中/英文新闻，description 自带摘要
+              return f"https://www.bing.com/news/search?q={urllib.parse.quote(q)}&format=rss&cc=us&setlang=en-us"
 
           DEFAULT_THEMES = {
               "AI": {"max": 5, "keywords": "", "sources": [
                   {"label": "OpenAI",      "url": "https://openai.com/news/rss.xml"},
-                  {"label": "Anthropic",   "url": g("site:anthropic.com")},
-                  {"label": "DeepMind",    "url": g("site:deepmind.google")},
+                  {"label": "Anthropic",   "url": bing("Anthropic")},
+                  {"label": "DeepMind",    "url": bing("DeepMind")},
                   {"label": "NVIDIA",      "url": "https://blogs.nvidia.com/feed/"},
                   {"label": "HF Blog",     "url": "https://huggingface.co/blog/feed.xml"},
                   {"label": "HF Papers",   "url": "https://huggingface.co/api/papers"},
@@ -77,7 +78,7 @@ jobs:
                   {"label": "LatentSpace", "url": "https://www.latent.space/feed"},
               ]},
               "科技": {"max": 5, "keywords": "", "sources": [
-                  {"label": "ReutersTech", "url": g("site:reuters.com technology")},
+                  {"label": "ReutersTech", "url": bing("site:reuters.com technology")},
                   {"label": "TechCrunch",  "url": "https://techcrunch.com/feed/"},
                   {"label": "TheVerge",    "url": "https://www.theverge.com/rss/index.xml"},
                   {"label": "ArsTechnica", "url": "https://feeds.arstechnica.com/arstechnica/index"},
@@ -89,19 +90,19 @@ jobs:
                   {"label": "Lobsters",    "url": "https://lobste.rs/newest.rss"},
               ]},
               "eVtol": {"max": 5, "keywords": "", "sources": [
-                  {"label": "ReutersAero", "url": g("site:reuters.com aerospace")},
-                  {"label": "FlightGlobal","url": g("site:flightglobal.com")},
-                  {"label": "AvWeek",      "url": g("site:aviationweek.com")},
-                  {"label": "AIN",         "url": g("site:ainonline.com")},
-                  {"label": "AirCurrent",  "url": g("site:theaircurrent.com")},
+                  {"label": "ReutersAero", "url": bing("site:reuters.com aerospace")},
+                  {"label": "FlightGlobal","url": bing("site:flightglobal.com")},
+                  {"label": "AvWeek",      "url": bing("site:aviationweek.com")},
+                  {"label": "AIN",         "url": bing("site:ainonline.com")},
+                  {"label": "eVTOL",       "url": bing("eVTOL")},
                   {"label": "VertMag",     "url": "https://verticalmag.com/feed/"},
-                  {"label": "低空经济",    "url": gz("(低空经济 OR eVTOL OR 无人机)")},
+                  {"label": "低空经济",    "url": bing("低空经济")},
               ]},
               "股市": {"max": 5, "keywords": "", "sources": [
-                  {"label": "ReutersMkt",  "url": g("site:reuters.com markets")},
-                  {"label": "FT Markets",  "url": g("site:ft.com markets")},
-                  {"label": "A股",         "url": gz("(A股 OR 沪指 OR 深成指 OR 创业板)")},
-                  {"label": "港股",        "url": gz("(港股 OR 恒生指数 OR 恒指)")},
+                  {"label": "ReutersMkt",  "url": bing("site:reuters.com markets")},
+                  {"label": "FT Markets",  "url": bing("site:ft.com markets")},
+                  {"label": "A股",         "url": bing("A股 沪指")},
+                  {"label": "港股",        "url": bing("港股 恒生指数")},
               ]},
           }
 
@@ -109,7 +110,7 @@ jobs:
           def bj_now():
               return datetime.now(timezone.utc) + timedelta(hours=8)
 
-          def fetch(url, timeout=30):
+          def fetch(url, timeout=25):
               req = urllib.request.Request(url, headers=UA)
               with urllib.request.urlopen(req, timeout=timeout) as r:
                   return r.read().decode("utf-8", errors="replace")
@@ -117,8 +118,11 @@ jobs:
           def clean(s):
               return re.sub(r"\s+", " ", s or "").strip()
 
+          def strip_html(s):
+              return clean(re.sub(r"<[^>]+>", " ", s or ""))
+
           def strip_src_suffix(t):
-              # 去掉 Google News 标题末尾的 " - 来源名"（小节已有【标签】）
+              # 去掉标题末尾的 " - 来源名"（条目已带来源标签）
               return re.sub(r"\s-\s[\w .'&+'-]+\Z", "", t).strip() or t
 
           def host(url):
@@ -133,7 +137,8 @@ jobs:
               try:
                   data = json.loads(body)
                   if isinstance(data, list):
-                      return [(clean(strip_src_suffix(it["title"])), it.get("url") or "")
+                      return [(clean(strip_src_suffix(it["title"])), it.get("url") or "",
+                               clean(it.get("summary") or it.get("description") or ""))
                               for it in data if isinstance(it, dict) and it.get("title")]
               except Exception:
                   pass
@@ -146,7 +151,8 @@ jobs:
               for it in root.findall(".//item"):
                   t = it.findtext("title") or ""
                   if t:
-                      entries.append((clean(strip_src_suffix(t)), it.findtext("link") or ""))
+                      entries.append((clean(strip_src_suffix(t)), it.findtext("link") or "",
+                                      clean(strip_html(it.findtext("description") or ""))))
               if not entries:
                   ns = {"a": "http://www.w3.org/2005/Atom"}
                   for it in root.findall(".//a:entry", ns):
@@ -156,8 +162,39 @@ jobs:
                           ln = lk.get("href", "")
                           break
                       if t:
-                          entries.append((clean(strip_src_suffix(t)), ln))
+                          entries.append((clean(strip_src_suffix(t)), ln,
+                                          clean(strip_html(it.findtext("a:summary", "", ns) or ""))))
               return entries
+
+          def desc_valid(desc, title):
+              # description 是否为有效摘要（排除与标题重复的垃圾 desc）
+              if not desc or len(desc) < 25:
+                  return False
+              n1 = re.sub(r"[\W_]+", "", desc.lower())
+              n2 = re.sub(r"[\W_]+", "", title.lower())
+              if n2 and n2 in n1 and len(n1) <= len(n2) + 20:
+                  return False
+              return True
+
+          def extract_summary(html_body, max_len=220):
+              # 从 HTML 提取正文首段（优先 <article>/<main> 内的 <p>）
+              h = re.sub(r"(?is)<(script|style|nav|header|footer|aside|form)[^>]*>.*?</\1>", " ", html_body)
+              m = re.search(r"(?is)<(article|main)[^>]*>(.*?)</(article|main)>", h)
+              region = m.group(2) if m else h
+              paras = re.findall(r"(?is)<p[^>]*>(.*?)</p>", region)
+              text = " ".join(re.sub(r"<[^>]+>", " ", p) for p in paras)
+              text = html.unescape(text)
+              text = clean(text)
+              if len(text) < 60:
+                  text = clean(html.unescape(re.sub(r"<[^>]+>", " ", html_body)))
+              return text[:max_len]
+
+          def fetch_summary(link, max_len=220):
+              try:
+                  body = fetch(link)
+              except Exception:
+                  return ""
+              return extract_summary(body, max_len)
 
           T_CACHE = {}
           def translate_zh(text):
@@ -177,8 +214,7 @@ jobs:
                   out = "".join(seg[0] for seg in j[0] if seg and seg[0]).strip()
                   T_CACHE[text] = out or text
                   return T_CACHE[text]
-              except Exception as e:
-                  print(f"  · 翻译失败({text[:30]}...): {str(e)[:40]}")
+              except Exception:
                   return text
 
           def pick_top(candidates, order, max_items=5, per_source=3):
@@ -189,11 +225,11 @@ jobs:
                   for label in order:
                       entries = candidates.get(label) or []
                       if round_i < len(entries):
-                          t, ln = entries[round_i]
+                          t, ln, d = entries[round_i]
                           key = re.sub(r"[^\w\u4e00-\u9fff]+", "", t.lower())
                           if key and key not in seen:
                               seen.add(key)
-                              selected.append((label, t, ln))
+                              selected.append((label, t, ln, d))
                               if len(selected) >= max_items:
                                   return selected
               return selected
@@ -271,16 +307,30 @@ jobs:
                   print(f"[{name}] 无可用内容，跳过")
                   continue
 
-              # 2. 轮换精选（每条来自不同源）+ 翻译成中文
+              # 2. 轮换精选（每条来自不同源）
               selected = pick_top(candidates, order, max_items=max_items)
               if not selected:
                   print(f"[{name}] 精选为空，跳过")
                   continue
-              print(f"[{name}] 已精选 {len(selected)} 条，翻译中...")
+              print(f"[{name}] 已精选 {len(selected)} 条，生成中文总结...")
+
+              # 3. 总结 + 翻译 + 组稿
               lines = []
-              for i, (label, t, ln) in enumerate(selected, 1):
-                  zh = translate_zh(t)
-                  lines.append(f"{i}. {html.escape(zh)}")
+              for i, (label, t, ln, desc) in enumerate(selected, 1):
+                  # 摘要来源：RSS description 优先 → 抓原文正文首段 → 无则仅标题
+                  if desc_valid(desc, t):
+                      raw = desc[:300]
+                  elif ln:
+                      raw = fetch_summary(ln)
+                  else:
+                      raw = ""
+                  zh_title = translate_zh(t)
+                  zh_full = translate_zh(raw) if raw else ""
+                  zh_sum = zh_full[:240].strip()
+                  trunc = "…" if len(zh_full) > 240 else ""
+                  lines.append(f"{i}. <b>{html.escape(zh_title)}</b>")
+                  if zh_sum:
+                      lines.append(f"   {html.escape(zh_sum)}{trunc}")
                   if ln:
                       lines.append(f"   <a href=\"{html.escape(ln, quote=True)}\">🔗 {html.escape(label)}</a>")
               body = "\n".join(lines)[:3900].strip()
@@ -288,7 +338,7 @@ jobs:
                   print(f"[{name}] 内容为空，跳过")
                   continue
 
-              # 3. 发送
+              # 4. 发送
               header = f"📰 <b>{name} · {date_label}</b>"
               message = f"{header}\n\n{body}\n\n- via 60s API"
               status, resp = tg_send(message)
