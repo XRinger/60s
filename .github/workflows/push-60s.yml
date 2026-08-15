@@ -124,6 +124,10 @@ jobs:
               with urllib.request.urlopen(req, timeout=timeout) as r:
                   return r.read().decode("utf-8", errors="replace")
 
+          def unescape2(s):
+              # 双重解码 HTML 实体（处理 &amp;#x27; 这类嵌套转义）
+              return html.unescape(html.unescape(s or ""))
+
           def clean(s):
               return re.sub(r"\s+", " ", s or "").strip()
 
@@ -160,14 +164,14 @@ jobs:
                       m = re.search(r"<title>(.*?)</title>", raw, re.S)
                       if not m:
                           continue
-                      t = strip_html(html.unescape(m.group(1)))
+                      t = strip_html(unescape2(m.group(1)))
                       t = strip_src_suffix(t)
                       if not t:
                           continue
                       lk = re.search(r"<link>(.*?)</link>", raw, re.S)
-                      ln = html.unescape(lk.group(1)).strip() if lk else ""
+                      ln = unescape2(lk.group(1)).strip() if lk else ""
                       ds = re.search(r"<description>(.*?)</description>", raw, re.S)
-                      d = strip_html(html.unescape(ds.group(1) if ds else "")) if ds else ""
+                      d = strip_html(unescape2(ds.group(1) if ds else "")) if ds else ""
                       # 图片：Bing News:Image → media:content → media:thumbnail → enclosure
                       img = ""
                       mi = re.search(r"<News:Image>(.*?)</News:Image>", raw, re.S)
@@ -231,36 +235,27 @@ jobs:
                       "minimize to nav", "a]:hidden", "sign in", "log in", "subscribe",
                       "cookie", "follow us", "share this", "privacy policy", "ot-pc", "onetrust", "optanon")
 
-          def extract_summary(html_body, max_len=500):
-              # 从 HTML 提取正文首段（优先 <article>/<main> 内的长段落，过滤 UI 导航垃圾）
+          def extract_summary(html_body, max_len=800):
+              # 从 HTML 提取正文（优先 <article>/<main> 内的干净段落，拼接多段至 max_len）
               h = re.sub(r"(?is)<(script|style|nav|header|footer|aside|form)[^>]*>.*?</\1>", " ", html_body)
               m = re.search(r"(?is)<(article|main)[^>]*>(.*?)</(article|main)>", h)
               region = m.group(2) if m else h
               paras = re.findall(r"(?is)<p[^>]*>(.*?)</p>", region)
-              paras = [clean(html.unescape(re.sub(r"<[^>]+>", " ", p))) for p in paras]
+              paras = [clean(unescape2(re.sub(r"<[^>]+>", " ", p))) for p in paras]
+              good = [p for p in paras if len(p) >= 40 and not any(w in p.lower() for w in UI_WORDS)]
+              if not good:
+                  good = [p for p in paras if not any(w in p.lower() for w in UI_WORDS)]
               text = ""
-              for p in paras:
-                  if len(p) >= 40:
-                      low = p.lower()
-                      if any(w in low for w in UI_WORDS):
-                          continue
-                      text = p
+              for p in good:
+                  if len(text) + len(p) + 1 > max_len:
                       break
-              if not text:
-                  # fallback：拼接所有干净长段落（同样过滤 UI 垃圾）
-                  text = " ".join(p for p in paras
-                                  if len(p) >= 40 and not any(w in p.lower() for w in UI_WORDS))
-              if len(text) < 40:
-                  # 无 ≥40 干净段落 → 取最长的干净段落（短正文也胜过整页垃圾）
-                  clean_paras = [p for p in paras if not any(w in p.lower() for w in UI_WORDS)]
-                  if clean_paras:
-                      text = max(clean_paras, key=len)
-                  else:
-                      text = clean(html.unescape(re.sub(r"<[^>]+>", " ", html_body)))
+                  text = (text + " " + p).strip()
+              if len(text) < 60:
+                  text = clean(unescape2(re.sub(r"<[^>]+>", " ", html_body)))
               return text[:max_len]
 
-          def fetch_summary(link, max_len=500):
-              # 无 RSS 描述时，抓原文正文首段作为内容（失败返回空串 → 仅标题）
+          def fetch_summary(link, max_len=800):
+              # 无 RSS 描述时，抓原文正文作为内容（失败返回空串 → 仅标题）
               try:
                   return extract_summary(fetch(link), max_len)
               except Exception:
@@ -403,22 +398,26 @@ jobs:
                   continue
               print(f"[{name}] 已精选 {len(selected)} 条，逐条生成中文内容...")
 
-              # 3. 每条新闻独立推送：图片(如有) → 加粗标题 → 正文 → 来源链接 → emoji
+              # 3. 每条新闻独立推送：图片(如有) → 加粗标题 → 正文 → 来源链接 → 分类 → 分隔线
               for label, t, ln, desc, img in selected:
                   if desc_valid(desc, t):
-                      raw = desc[:500]
+                      raw = desc[:800]
                   elif ln:
                       raw = fetch_summary(ln)
                   else:
                       raw = ""
                   zh_title = translate_zh(t)
-                  zh_sum = translate_zh(raw)[:400].strip() if raw else ""
+                  zh_sum = translate_zh(raw)[:600].strip() if raw else ""
+                  # 兜底解码残留 HTML 实体（页面正文偶发多层转义）
+                  zh_title = unescape2(zh_title)
+                  zh_sum = unescape2(zh_sum)
                   lines = [f"<b>{html.escape(zh_title)}</b>"]
                   if zh_sum:
                       lines.append(html.escape(zh_sum))
                   if ln:
                       lines.append(f"<a href=\"{html.escape(ln, quote=True)}\">{html.escape(label)}</a>")
                   lines.append(f"{emoji} {name}" if emoji else name)  # 分类行：emoji + 分类名
+                  lines.append("────────────")  # 消息分隔线（Telegram 连续消息紧凑无间距）
                   text = "\n\n".join(lines)
                   if img and img_ok(img):
                       status, resp = tg_send_photo(img, text[:1024])
