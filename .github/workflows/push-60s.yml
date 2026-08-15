@@ -1,8 +1,9 @@
 name: Daily News → Telegram
 
 # ============================================================
-# 用途：按【主题】抓取新闻，每个主题精选 5 条，每条推送：
-#   中文标题 + 中文内容总结（全文摘要）+ 可点击来源链接
+# 用途：按【主题】抓取新闻，每个主题精选 5 条。每条推送：
+#   - 带图的新闻 → 图片消息（配图 + 中文标题 + 中文总结 + 来源链接）
+#   - 无图的新闻 → 汇总进主题文本消息（中文标题 + 中文总结 + 来源链接）
 #
 # 必做（GitHub 网页操作，只需一次）：
 #   Settings → Secrets and variables → Actions → New repository secret
@@ -16,6 +17,7 @@ name: Daily News → Telegram
 #   - 键的顺序 = 推送顺序；sources 可为字符串 URL 或 {"label","url"} 对象
 #   - 支持的源类型：RSS / Atom / JSON 数组（含 title 字段）/ Bing News RSS
 #   - 摘要来源优先级：RSS description → 抓原文正文首段 → 仅标题
+#   - 图片来源：Bing News:Image / media:content / media:thumbnail / enclosure
 #   - max = 每主题最终推送条数（默认 5）：全部源汇总后按源顺序轮换精选，每条来自不同源
 #   - keywords 逗号分隔，留空 = 全部条目参与精选；非空 = 只精选含任一关键词的条目（无匹配则跳过该主题）
 #   - 英文内容自动翻译为简体中文（Google 翻译，无需任何密钥）；中文内容原样保留
@@ -49,7 +51,7 @@ jobs:
           THEMES: ${{ vars.THEMES }}
         run: |
           python3 - <<'PYEOF'
-          import html, json, os, re, sys, urllib.parse, urllib.request
+          import html, json, os, re, sys, time, urllib.parse, urllib.request
           from datetime import datetime, timezone, timedelta
           from xml.etree import ElementTree as ET
 
@@ -61,8 +63,9 @@ jobs:
 
           # ---------- 内置默认主题（31 个已实测可用的源；THEMES 变量可整体覆盖） ----------
           def bing(q):
-              # Bing News RSS：英文端点可同时返回中/英文新闻，description 自带摘要
-              return f"https://www.bing.com/news/search?q={urllib.parse.quote(q)}&format=rss&cc=us&setlang=en-us"
+              # Bing News RSS：英文端点可同时返回中/英文新闻，description 自带摘要，
+              # 条目带 <News:Image> 缩略图
+              return "https://www.bing.com/news/search?q={}&format=rss&cc=us&setlang=en-us".format(urllib.parse.quote(q))
 
           DEFAULT_THEMES = {
               "AI": {"max": 5, "keywords": "", "sources": [
@@ -138,33 +141,64 @@ jobs:
                   data = json.loads(body)
                   if isinstance(data, list):
                       return [(clean(strip_src_suffix(it["title"])), it.get("url") or "",
-                               clean(it.get("summary") or it.get("description") or ""))
+                               clean(it.get("summary") or it.get("description") or ""), "")
                               for it in data if isinstance(it, dict) and it.get("title")]
               except Exception:
                   pass
-              # RSS / Atom
+              # RSS / Bing News RSS：按 <item> 正则切分
+              # （Bing 的 xmlns:News 命名空间是动态查询 URL，不能用 ElementTree 命名空间查询）
+              items = re.findall(r"(?s)<item>.*?</item>", body)
+              if items:
+                  entries = []
+                  for raw in items:
+                      m = re.search(r"<title>(.*?)</title>", raw, re.S)
+                      if not m:
+                          continue
+                      t = strip_html(html.unescape(m.group(1)))
+                      t = strip_src_suffix(t)
+                      if not t:
+                          continue
+                      lk = re.search(r"<link>(.*?)</link>", raw, re.S)
+                      ln = html.unescape(lk.group(1)).strip() if lk else ""
+                      ds = re.search(r"<description>(.*?)</description>", raw, re.S)
+                      d = strip_html(html.unescape(ds.group(1) if ds else "")) if ds else ""
+                      # 图片：Bing News:Image → media:content → media:thumbnail → enclosure
+                      img = ""
+                      mi = re.search(r"<News:Image>(.*?)</News:Image>", raw, re.S)
+                      if mi:
+                          img = html.unescape(mi.group(1)).strip()
+                      if not img:
+                          mc = re.search(r'<media:content[^>]*url="([^"]+)"', raw)
+                          if mc:
+                              img = mc.group(1)
+                      if not img:
+                          mt = re.search(r'<media:thumbnail[^>]*url="([^"]+)"', raw)
+                          if mt:
+                              img = mt.group(1)
+                      if not img:
+                          en = re.search(r'<enclosure[^>]*type="image/[^"]*"[^>]*url="([^"]+)"', raw)
+                          if en:
+                              img = en.group(1)
+                      entries.append((t, ln, d, img))
+                  return entries
+              # Atom 回退
               try:
                   root = ET.fromstring(body)
               except Exception:
                   return []
-              entries = []
-              for it in root.findall(".//item"):
-                  t = it.findtext("title") or ""
-                  if t:
-                      entries.append((clean(strip_src_suffix(t)), it.findtext("link") or "",
-                                      clean(strip_html(it.findtext("description") or ""))))
-              if not entries:
-                  ns = {"a": "http://www.w3.org/2005/Atom"}
-                  for it in root.findall(".//a:entry", ns):
-                      t = it.findtext("a:title", "", ns)
-                      ln = ""
-                      for lk in it.findall("a:link", ns):
-                          ln = lk.get("href", "")
-                          break
-                      if t:
-                          entries.append((clean(strip_src_suffix(t)), ln,
-                                          clean(strip_html(it.findtext("a:summary", "", ns) or ""))))
-              return entries
+              ns = {"a": "http://www.w3.org/2005/Atom"}
+              out = []
+              for it in root.findall(".//a:entry", ns):
+                  t = it.findtext("a:title", "", ns)
+                  if not t:
+                      continue
+                  ln = ""
+                  for lk in it.findall("a:link", ns):
+                      ln = lk.get("href", "")
+                      break
+                  d = it.findtext("a:summary", "", ns) or ""
+                  out.append((clean(strip_src_suffix(t)), ln, clean(d), ""))
+              return out
 
           def desc_valid(desc, title):
               # description 是否为有效摘要（排除与标题重复的垃圾 desc）
@@ -176,28 +210,19 @@ jobs:
                   return False
               return True
 
-          def extract_summary(html_body, max_len=220):
-              # 从 HTML 提取正文首段（优先 <article>/<main> 内的 <p>）
-              h = re.sub(r"(?is)<(script|style|nav|header|footer|aside|form)[^>]*>.*?</\1>", " ", html_body)
-              m = re.search(r"(?is)<(article|main)[^>]*>(.*?)</(article|main)>", h)
-              region = m.group(2) if m else h
-              paras = re.findall(r"(?is)<p[^>]*>(.*?)</p>", region)
-              text = " ".join(re.sub(r"<[^>]+>", " ", p) for p in paras)
-              text = html.unescape(text)
-              text = clean(text)
-              if len(text) < 60:
-                  text = clean(html.unescape(re.sub(r"<[^>]+>", " ", html_body)))
-              return text[:max_len]
-
-          def fetch_summary(link, max_len=220):
+          def img_ok(url):
+              # 验证图片 URL 可公开访问（返回 image 类型），防止发给 Telegram 后失败
               try:
-                  body = fetch(link)
+                  req = urllib.request.Request(url, headers=UA)
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      ct = r.headers.get("Content-Type", "")
+                      r.read(1024)
+                      return "image" in ct
               except Exception:
-                  return ""
-              return extract_summary(body, max_len)
+                  return False
 
           T_CACHE = {}
-          def translate_zh(text):
+          def translate_zh(text, _retry=0):
               # 已是中文则跳过；否则用 Google 翻译成简体中文（免费，无需密钥）
               if not text or re.search(r"[\u4e00-\u9fff]", text):
                   return text
@@ -214,6 +239,12 @@ jobs:
                   out = "".join(seg[0] for seg in j[0] if seg and seg[0]).strip()
                   T_CACHE[text] = out or text
                   return T_CACHE[text]
+              except urllib.error.HTTPError as e:
+                  # 限流(429)重试，退避等待
+                  if e.code == 429 and _retry < 3:
+                      time.sleep(2 * (_retry + 1))
+                      return translate_zh(text, _retry + 1)
+                  return text
               except Exception:
                   return text
 
@@ -225,11 +256,11 @@ jobs:
                   for label in order:
                       entries = candidates.get(label) or []
                       if round_i < len(entries):
-                          t, ln, d = entries[round_i]
+                          t, ln, d, img = entries[round_i]
                           key = re.sub(r"[^\w\u4e00-\u9fff]+", "", t.lower())
                           if key and key not in seen:
                               seen.add(key)
-                              selected.append((label, t, ln, d))
+                              selected.append((label, t, ln, d, img))
                               if len(selected) >= max_items:
                                   return selected
               return selected
@@ -245,6 +276,22 @@ jobs:
                   f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", data=data)
               try:
                   with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.status, r.read().decode("utf-8", errors="replace")
+              except Exception as e:
+                  return None, str(e)
+
+          def tg_send_photo(img_url, caption):
+              # 图片消息（Telegram 服务器自行抓取图片 URL）
+              data = urllib.parse.urlencode({
+                  "chat_id": CHAT_ID,
+                  "photo": img_url,
+                  "caption": caption,
+                  "parse_mode": "HTML",
+              }).encode()
+              req = urllib.request.Request(
+                  f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto", data=data)
+              try:
+                  with urllib.request.urlopen(req, timeout=40) as r:
                       return r.status, r.read().decode("utf-8", errors="replace")
               except Exception as e:
                   return None, str(e)
@@ -314,42 +361,59 @@ jobs:
                   continue
               print(f"[{name}] 已精选 {len(selected)} 条，生成中文总结...")
 
-              # 3. 总结 + 翻译 + 组稿
-              lines = []
-              for i, (label, t, ln, desc) in enumerate(selected, 1):
-                  # 摘要来源：RSS description 优先 → 抓原文正文首段 → 无则仅标题
+              # 3. 摘要 + 翻译 + 分拣（有图 → 图片消息；无图 → 文本消息）
+              photo_items, text_items = [], []
+              for label, t, ln, desc, img in selected:
                   if desc_valid(desc, t):
                       raw = desc[:300]
-                  elif ln:
-                      raw = fetch_summary(ln)
                   else:
                       raw = ""
                   zh_title = translate_zh(t)
-                  zh_full = translate_zh(raw) if raw else ""
-                  zh_sum = zh_full[:240].strip()
-                  trunc = "…" if len(zh_full) > 240 else ""
-                  lines.append(f"{i}. <b>{html.escape(zh_title)}</b>")
-                  if zh_sum:
-                      lines.append(f"   {html.escape(zh_sum)}{trunc}")
-                  if ln:
-                      lines.append(f"   <a href=\"{html.escape(ln, quote=True)}\">🔗 {html.escape(label)}</a>")
-              body = "\n".join(lines)[:3900].strip()
-              if not body:
-                  print(f"[{name}] 内容为空，跳过")
-                  continue
+                  zh_sum = translate_zh(raw)[:240].strip() if raw else ""
+                  if img and img_ok(img):
+                      photo_items.append((img, label, zh_title, zh_sum, ln))
+                  else:
+                      text_items.append((label, zh_title, zh_sum, ln))
 
-              # 4. 发送
-              header = f"📰 <b>{name} · {date_label}</b>"
-              message = f"{header}\n\n{body}\n\n- via 60s API"
-              status, resp = tg_send(message)
-              if status == 200:
-                  success += 1
-                  print(f"[{name}] ✅ 已发送 ({len(body)} 字符)")
-              else:
-                  print(f"[{name}] ❌ 发送失败: HTTP {status} {resp}")
+              # 4a. 文本消息（无图新闻汇总）
+              if text_items:
+                  lines = [f"📰 <b>{name} · {date_label}</b>", ""]
+                  for i, (label, zh_title, zh_sum, ln) in enumerate(text_items, 1):
+                      lines.append(f"{i}. <b>{html.escape(zh_title)}</b>")
+                      if zh_sum:
+                          lines.append(f"   {html.escape(zh_sum)}")
+                      if ln:
+                          lines.append(f"   <a href=\"{html.escape(ln, quote=True)}\">🔗 {html.escape(label)}</a>")
+                      lines.append("")
+                  body = "\n".join(lines)[:3900].strip()
+                  status, resp = tg_send(body)
+                  if status == 200:
+                      success += 1
+                      print(f"[{name}] ✅ 文本消息已发送 ({len(body)} 字符)")
+                  else:
+                      print(f"[{name}] ❌ 文本消息失败: HTTP {status} {resp}")
+
+              # 4b. 图片消息（有图新闻，每条一张配图）
+              for img, label, zh_title, zh_sum, ln in photo_items:
+                  cap = [f"📰 <b>{name} · {date_label}</b>", f"<b>{html.escape(zh_title)}</b>"]
+                  if zh_sum:
+                      cap.append(html.escape(zh_sum))
+                  if ln:
+                      cap.append(f"<a href=\"{html.escape(ln, quote=True)}\">🔗 {html.escape(label)}</a>")
+                  caption = "\n".join(cap)[:1024]
+                  status, resp = tg_send_photo(img, caption)
+                  if status == 200:
+                      success += 1
+                      print(f"[{name}] ✅ 图片消息已发送 ({label})")
+                  else:
+                      # 降级：图片发送失败则以文本形式发送该条
+                      print(f"[{name}] ⚠️ {label} 图片发送失败 HTTP {status}，降级为文本")
+                      status2, resp2 = tg_send(f"📰 <b>{name} · {date_label}</b>\n\n{caption}")
+                      if status2 == 200:
+                          success += 1
 
           if success == 0:
               print("::error::所有主题消息均发送失败")
               sys.exit(1)
-          print(f"完成: {success}/{len(themes)} 个主题发送成功")
+          print(f"完成: {success} 条消息发送成功")
           PYEOF
